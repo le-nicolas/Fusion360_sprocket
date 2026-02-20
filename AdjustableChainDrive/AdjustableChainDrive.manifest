@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "4eb6af01-2bfd-44f2-a2d4-f59585f7437c",
+  "author": "le-nicolas",
+  "description": {
+    "": "Generates a chain loop around drive and driven sprockets using automatic or manual center distance."
+  },
+  "version": "1.0.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
