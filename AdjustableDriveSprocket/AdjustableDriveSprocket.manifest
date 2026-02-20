@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "0e2af264-410f-4f58-b8e8-b31f2654dcae",
+  "author": "le-nicolas",
+  "description": {
+    "": "Creates a drive sprocket body with adjustable tooth count and key dimensions."
+  },
+  "version": "1.0.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
