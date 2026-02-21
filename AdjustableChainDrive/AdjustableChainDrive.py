@@ -2,6 +2,8 @@ import adsk.core
 import adsk.fusion
 import traceback
 import math
+import csv
+import datetime
 
 APP_NAME = 'Adjustable Chain Drive'
 CMD_ID = 'com.lenicolas.adjustablechaindrive'
@@ -10,13 +12,19 @@ CMD_DESC = 'Generate a chain loop around drive and driven sprockets with automat
 WORKSPACE_ID = 'FusionSolidEnvironment'
 PANEL_ID = 'SolidCreatePanel'
 
+MIN_SPROCKET_TEETH = 9
+RECOMMENDED_CENTER_MIN_PITCHES = 30.0
+RECOMMENDED_CENTER_MAX_PITCHES = 50.0
+ATTRIBUTE_GROUP = 'com.lenicolas.sprocket'
+ATTR_ROLE = 'role'
+ATTR_PAIR_ID = 'pair_id'
+
 handlers = []
 
 
 def run(context):
     app = adsk.core.Application.get()
     ui = app.userInterface
-
     try:
         command_def = ui.commandDefinitions.itemById(CMD_ID)
         if not command_def:
@@ -34,7 +42,6 @@ def run(context):
 
         control.isPromoted = True
         control.isPromotedByDefault = True
-
     except Exception:
         if ui:
             ui.messageBox('Add-in start failed:\n{}'.format(traceback.format_exc()))
@@ -43,7 +50,6 @@ def run(context):
 def stop(context):
     app = adsk.core.Application.get()
     ui = app.userInterface
-
     try:
         workspace = ui.workspaces.itemById(WORKSPACE_ID)
         panel = workspace.toolbarPanels.itemById(PANEL_ID)
@@ -54,7 +60,6 @@ def stop(context):
         command_def = ui.commandDefinitions.itemById(CMD_ID)
         if command_def:
             command_def.deleteMe()
-
     except Exception:
         if ui:
             ui.messageBox('Add-in stop failed:\n{}'.format(traceback.format_exc()))
@@ -107,7 +112,56 @@ def _selection_to_occurrence(selection_input, root_component):
     return None
 
 
-def _find_default_sprocket_occurrences(root_component):
+def _get_attribute_value(entity, key):
+    if not entity:
+        return None
+    attr = entity.attributes.itemByName(ATTRIBUTE_GROUP, key)
+    return attr.value if attr else None
+
+
+def _tagged_role_for_occurrence(occurrence):
+    role = _get_attribute_value(occurrence, ATTR_ROLE)
+    if not role:
+        role = _get_attribute_value(occurrence.component, ATTR_ROLE)
+    return role.lower() if role else None
+
+
+def _tagged_pair_id_for_occurrence(occurrence):
+    pair_id = _get_attribute_value(occurrence, ATTR_PAIR_ID)
+    if not pair_id:
+        pair_id = _get_attribute_value(occurrence.component, ATTR_PAIR_ID)
+    return pair_id
+
+
+def _find_tagged_sprocket_occurrences(root_component):
+    pair_map = {}
+    fallback_drive = None
+    fallback_driven = None
+
+    all_occurrences = root_component.allOccurrences
+    for i in range(all_occurrences.count):
+        occurrence = all_occurrences.item(i)
+        role = _tagged_role_for_occurrence(occurrence)
+        if role not in ['drive', 'driven']:
+            continue
+
+        if role == 'drive' and fallback_drive is None:
+            fallback_drive = occurrence
+        if role == 'driven' and fallback_driven is None:
+            fallback_driven = occurrence
+
+        pair_id = _tagged_pair_id_for_occurrence(occurrence)
+        if pair_id:
+            pair_map.setdefault(pair_id, {})[role] = occurrence
+
+    for pair in pair_map.values():
+        if 'drive' in pair and 'driven' in pair:
+            return pair['drive'], pair['driven']
+
+    return fallback_drive, fallback_driven
+
+
+def _find_named_sprocket_occurrences(root_component):
     drive_occ = None
     driven_occ = None
 
@@ -115,11 +169,13 @@ def _find_default_sprocket_occurrences(root_component):
     for i in range(all_occurrences.count):
         occurrence = all_occurrences.item(i)
         comp_name = occurrence.component.name.lower()
+        if 'sprocket' not in comp_name:
+            continue
 
-        if drive_occ is None and ('drive sprocket' in comp_name):
+        if drive_occ is None and ('drive' in comp_name) and ('driven' not in comp_name):
             drive_occ = occurrence
 
-        if driven_occ is None and ('driven sprocket' in comp_name):
+        if driven_occ is None and ('driven' in comp_name):
             driven_occ = occurrence
 
         if drive_occ and driven_occ:
@@ -127,6 +183,43 @@ def _find_default_sprocket_occurrences(root_component):
 
     return drive_occ, driven_occ
 
+
+def _resolve_occurrences(inputs, root_component):
+    drive_selection = adsk.core.SelectionCommandInput.cast(inputs.itemById('driveOccurrence'))
+    driven_selection = adsk.core.SelectionCommandInput.cast(inputs.itemById('drivenOccurrence'))
+
+    drive_occ = _selection_to_occurrence(drive_selection, root_component)
+    driven_occ = _selection_to_occurrence(driven_selection, root_component)
+    if drive_occ and driven_occ:
+        return drive_occ, driven_occ, 'explicitly selected sprocket occurrences'
+
+    tagged_drive = None
+    tagged_driven = None
+    if (not drive_occ) or (not driven_occ):
+        tagged_drive, tagged_driven = _find_tagged_sprocket_occurrences(root_component)
+        if not drive_occ:
+            drive_occ = tagged_drive
+        if not driven_occ:
+            driven_occ = tagged_driven
+
+    if drive_occ and driven_occ:
+        if drive_selection.selectionCount > 0 or driven_selection.selectionCount > 0:
+            return drive_occ, driven_occ, 'selected + attribute-tagged sprocket occurrences'
+        return drive_occ, driven_occ, 'attribute-tagged sprocket occurrences'
+
+    if (not drive_occ) or (not driven_occ):
+        named_drive, named_driven = _find_named_sprocket_occurrences(root_component)
+        if not drive_occ:
+            drive_occ = named_drive
+        if not driven_occ:
+            driven_occ = named_driven
+
+    if drive_occ and driven_occ:
+        if tagged_drive or tagged_driven:
+            return drive_occ, driven_occ, 'attribute/name-detected sprocket occurrences'
+        return drive_occ, driven_occ, 'name-detected sprocket occurrences'
+
+    return drive_occ, driven_occ, 'unresolved'
 
 def _compute_chain_path(c1_xy, c2_xy, r1, r2):
     center_distance = _distance_2d(c1_xy, c2_xy)
@@ -220,21 +313,6 @@ def _sample_chain_points(path_data, link_count):
     return points, step
 
 
-def _set_input_state(inputs):
-    use_selected = inputs.itemById('useSelectedSprockets').value
-    auto_links = inputs.itemById('autoLinkCount').value
-
-    drive_input = adsk.core.SelectionCommandInput.cast(inputs.itemById('driveOccurrence'))
-    driven_input = adsk.core.SelectionCommandInput.cast(inputs.itemById('drivenOccurrence'))
-    center_input = adsk.core.ValueCommandInput.cast(inputs.itemById('manualCenterDistance'))
-    link_count_input = adsk.core.IntegerSpinnerCommandInput.cast(inputs.itemById('linkCount'))
-
-    drive_input.isEnabled = use_selected
-    driven_input.isEnabled = use_selected
-    center_input.isEnabled = not use_selected
-    link_count_input.isEnabled = not auto_links
-
-
 def _create_reference_sketch(component, path_data):
     sketch = component.sketches.add(component.xYConstructionPlane)
 
@@ -295,6 +373,208 @@ def _create_chain_rollers(component, chain_points, roller_radius, chain_width):
         if extrude.bodies.count > 0:
             extrude.bodies.item(0).name = 'ChainRoller_{}'.format(i + 1)
 
+def _validate_inputs(
+    drive_teeth,
+    driven_teeth,
+    chain_pitch,
+    roller_diameter,
+    chain_width,
+    use_selected,
+    manual_center_distance,
+    auto_link_count,
+    requested_link_count,
+):
+    errors = []
+
+    if drive_teeth < MIN_SPROCKET_TEETH or driven_teeth < MIN_SPROCKET_TEETH:
+        errors.append('Both tooth counts must be at least {}.'.format(MIN_SPROCKET_TEETH))
+
+    if chain_pitch <= 0 or roller_diameter <= 0 or chain_width <= 0:
+        errors.append('Chain pitch, roller diameter, and chain width must be positive.')
+
+    if roller_diameter >= chain_pitch:
+        errors.append('Roller diameter must be smaller than chain pitch.')
+
+    if (not use_selected) and (manual_center_distance <= 0):
+        errors.append('Manual center distance must be positive when selection mode is off.')
+
+    if (not auto_link_count) and (requested_link_count < 10):
+        errors.append('Manual link count must be at least 10.')
+
+    return errors
+
+
+def _center_distance_warnings(center_distance, chain_pitch):
+    warnings = []
+
+    if chain_pitch <= 0:
+        return warnings
+
+    center_in_pitches = center_distance / chain_pitch
+    if center_in_pitches < RECOMMENDED_CENTER_MIN_PITCHES or center_in_pitches > RECOMMENDED_CENTER_MAX_PITCHES:
+        warnings.append(
+            (
+                'Center distance is {:.2f} pitches. Recommended range is '
+                '{:.0f}-{:.0f} pitches (ISO 606 / ANSI B29.1 common practice).'
+            ).format(center_in_pitches, RECOMMENDED_CENTER_MIN_PITCHES, RECOMMENDED_CENTER_MAX_PITCHES)
+        )
+
+    return warnings
+
+
+def _determine_link_count(path_data, chain_pitch, auto_link_count, requested_link_count, enforce_even_links):
+    raw_link_count = max(10, int(round(path_data['total_length'] / chain_pitch))) if auto_link_count else requested_link_count
+    final_link_count = raw_link_count
+    even_adjusted = False
+
+    if enforce_even_links and (final_link_count % 2 != 0):
+        final_link_count += 1
+        even_adjusted = True
+
+    return raw_link_count, final_link_count, even_adjusted
+
+
+def _half_link_note(link_count, drive_teeth, driven_teeth):
+    if link_count % 2 == 0:
+        return None
+    if drive_teeth == driven_teeth:
+        return 'Odd link count with equal-size sprockets requires a half-link (offset link).'
+    return 'Odd link count requires a half-link (offset link).'
+
+
+def _format_issues(issues):
+    return '' if not issues else '\n- ' + '\n- '.join(issues)
+
+
+def _write_csv_rows(path, rows):
+    with open(path, 'w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(['Field', 'Value'])
+        for key, value in rows:
+            writer.writerow([key, value])
+
+
+def _export_csv_dialog(ui, filename_seed, rows):
+    file_dialog = ui.createFileDialog()
+    file_dialog.title = 'Export Chain Drive CSV'
+    file_dialog.filter = 'CSV Files (*.csv)'
+    file_dialog.filterIndex = 0
+    file_dialog.initialFilename = '{}_{}.csv'.format(
+        filename_seed,
+        datetime.datetime.now().strftime('%Y%m%d_%H%M%S'),
+    )
+
+    if file_dialog.showSave() != adsk.core.DialogResults.DialogOK:
+        return None
+
+    _write_csv_rows(file_dialog.filename, rows)
+    return file_dialog.filename
+
+
+def _set_input_state(inputs):
+    use_selected = inputs.itemById('useSelectedSprockets').value
+    auto_links = inputs.itemById('autoLinkCount').value
+
+    adsk.core.SelectionCommandInput.cast(inputs.itemById('driveOccurrence')).isEnabled = use_selected
+    adsk.core.SelectionCommandInput.cast(inputs.itemById('drivenOccurrence')).isEnabled = use_selected
+    adsk.core.ValueCommandInput.cast(inputs.itemById('manualCenterDistance')).isEnabled = not use_selected
+    adsk.core.IntegerSpinnerCommandInput.cast(inputs.itemById('linkCount')).isEnabled = not auto_links
+
+
+def _build_preview_text(inputs):
+    try:
+        drive_teeth = inputs.itemById('driveToothCount').value
+        driven_teeth = inputs.itemById('drivenToothCount').value
+        chain_pitch = inputs.itemById('chainPitch').value
+        roller_diameter = inputs.itemById('rollerDiameter').value
+        chain_width = inputs.itemById('chainWidth').value
+        use_selected = inputs.itemById('useSelectedSprockets').value
+        manual_center_distance = inputs.itemById('manualCenterDistance').value
+        auto_link_count = inputs.itemById('autoLinkCount').value
+        requested_link_count = inputs.itemById('linkCount').value
+        enforce_even_links = inputs.itemById('enforceEvenLinks').value
+
+        errors = _validate_inputs(
+            drive_teeth,
+            driven_teeth,
+            chain_pitch,
+            roller_diameter,
+            chain_width,
+            use_selected,
+            manual_center_distance,
+            auto_link_count,
+            requested_link_count,
+        )
+        if errors:
+            return 'Input issues:{}\n\nFix values to preview derived chain data.'.format(_format_issues(errors))
+
+        pitch_radius_1 = _pitch_radius(chain_pitch, drive_teeth)
+        pitch_radius_2 = _pitch_radius(chain_pitch, driven_teeth)
+
+        center_distance = None
+        center_source = ''
+        if use_selected:
+            design = adsk.fusion.Design.cast(adsk.core.Application.get().activeProduct)
+            if design:
+                drive_occ, driven_occ, center_source = _resolve_occurrences(inputs, design.rootComponent)
+                if drive_occ and driven_occ:
+                    c1 = _get_occurrence_center(drive_occ)
+                    c2 = _get_occurrence_center(driven_occ)
+                    center_distance = _distance_2d((c1[0], c1[1]), (c2[0], c2[1]))
+            if center_distance is None:
+                return (
+                    'Live summary\n\n'
+                    'Center source unresolved. Select both sprockets or run tagged sprocket generation first.'
+                )
+        else:
+            center_distance = manual_center_distance
+            center_source = 'manual center distance input'
+
+        lines = [
+            'Live summary',
+            '',
+            'Center source: {}'.format(center_source),
+            'Center distance: {:.3f} mm ({:.2f} pitches)'.format(center_distance * 10.0, center_distance / chain_pitch),
+        ]
+
+        if center_distance <= (pitch_radius_1 + pitch_radius_2):
+            lines.append('Warning: sprocket centers are too close for valid wrap.')
+            return '\n'.join(lines)
+
+        path_data = _compute_chain_path((0.0, 0.0), (center_distance, 0.0), pitch_radius_1, pitch_radius_2)
+        if not path_data:
+            lines.append('Warning: could not compute valid chain tangency.')
+            return '\n'.join(lines)
+
+        raw_count, final_count, even_adjusted = _determine_link_count(
+            path_data,
+            chain_pitch,
+            auto_link_count,
+            requested_link_count,
+            enforce_even_links,
+        )
+        lines.append('Estimated loop length: {:.3f} mm'.format(path_data['total_length'] * 10.0))
+        lines.append('Preview link count: {}'.format(final_count))
+
+        if even_adjusted:
+            lines.append('Note: rounded from {} to {} to keep an even count.'.format(raw_count, final_count))
+
+        half_link = _half_link_note(final_count, drive_teeth, driven_teeth)
+        if half_link:
+            lines.append('Warning: {}'.format(half_link))
+
+        for warning in _center_distance_warnings(center_distance, chain_pitch):
+            lines.append('Warning: {}'.format(warning))
+
+        return '\n'.join(lines)
+    except Exception:
+        return 'Live summary unavailable for current inputs.'
+
+
+def _update_preview_text(inputs):
+    preview = adsk.core.TextBoxCommandInput.cast(inputs.itemById('previewInfo'))
+    if preview:
+        preview.text = _build_preview_text(inputs)
 
 class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
     def __init__(self):
@@ -308,8 +588,8 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             command = adsk.core.Command.cast(args.command)
             inputs = command.commandInputs
 
-            inputs.addIntegerSpinnerCommandInput('driveToothCount', 'Drive Tooth Count', 6, 240, 1, 24)
-            inputs.addIntegerSpinnerCommandInput('drivenToothCount', 'Driven Tooth Count', 6, 240, 1, 48)
+            inputs.addIntegerSpinnerCommandInput('driveToothCount', 'Drive Tooth Count', MIN_SPROCKET_TEETH, 240, 1, 24)
+            inputs.addIntegerSpinnerCommandInput('drivenToothCount', 'Driven Tooth Count', MIN_SPROCKET_TEETH, 240, 1, 48)
 
             inputs.addValueInput('chainPitch', 'Chain Pitch', 'mm', adsk.core.ValueInput.createByString('12.7 mm'))
             inputs.addValueInput('rollerDiameter', 'Roller Diameter', 'mm', adsk.core.ValueInput.createByString('7.9 mm'))
@@ -320,7 +600,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             drive_occurrence_input = inputs.addSelectionInput(
                 'driveOccurrence',
                 'Drive Sprocket Occurrence',
-                'Select the drive sprocket occurrence (optional if auto-detected by name).',
+                'Select the drive sprocket occurrence (optional when tagged sprockets exist).',
             )
             drive_occurrence_input.addSelectionFilter('Occurrences')
             drive_occurrence_input.setSelectionLimits(0, 1)
@@ -328,7 +608,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             driven_occurrence_input = inputs.addSelectionInput(
                 'drivenOccurrence',
                 'Driven Sprocket Occurrence',
-                'Select the driven sprocket occurrence (optional if auto-detected by name).',
+                'Select the driven sprocket occurrence (optional when tagged sprockets exist).',
             )
             driven_occurrence_input.addSelectionFilter('Occurrences')
             driven_occurrence_input.setSelectionLimits(0, 1)
@@ -338,8 +618,18 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             inputs.addBoolValueInput('autoLinkCount', 'Auto Link Count', True, '', True)
             inputs.addIntegerSpinnerCommandInput('linkCount', 'Manual Link Count', 10, 6000, 1, 120)
             inputs.addBoolValueInput('enforceEvenLinks', 'Force Even Link Count', True, '', True)
+            inputs.addBoolValueInput('exportCsv', 'Export CSV Summary', True, '', False)
+
+            inputs.addTextBoxCommandInput(
+                'previewInfo',
+                'Live Summary',
+                'Adjust values to preview center distance, link count, and warnings.',
+                8,
+                True,
+            )
 
             _set_input_state(inputs)
+            _update_preview_text(inputs)
 
             on_input_changed = CommandInputChangedHandler()
             command.inputChanged.add(on_input_changed)
@@ -372,9 +662,12 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
             if not changed_input:
                 return
 
+            command = adsk.core.Command.cast(event_args.firingEvent.sender)
             if changed_input.id in ['useSelectedSprockets', 'autoLinkCount']:
-                command = adsk.core.Command.cast(event_args.firingEvent.sender)
                 _set_input_state(command.commandInputs)
+
+            if changed_input.id != 'previewInfo':
+                _update_preview_text(command.commandInputs)
 
         except Exception:
             if ui:
@@ -411,56 +704,48 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             auto_link_count = inputs.itemById('autoLinkCount').value
             requested_link_count = inputs.itemById('linkCount').value
             enforce_even_links = inputs.itemById('enforceEvenLinks').value
+            export_csv = inputs.itemById('exportCsv').value
 
-            if chain_pitch <= 0 or roller_diameter <= 0 or chain_width <= 0:
-                ui.messageBox('Chain pitch, roller diameter, and chain width must be positive.')
+            input_errors = _validate_inputs(
+                drive_teeth,
+                driven_teeth,
+                chain_pitch,
+                roller_diameter,
+                chain_width,
+                use_selected,
+                manual_center_distance,
+                auto_link_count,
+                requested_link_count,
+            )
+            if input_errors:
+                ui.messageBox('Input validation failed:{}\n\nFix the values and run again.'.format(_format_issues(input_errors)))
                 return
 
             pitch_radius_1 = _pitch_radius(chain_pitch, drive_teeth)
             pitch_radius_2 = _pitch_radius(chain_pitch, driven_teeth)
 
             root_component = design.rootComponent
-
-            center_1 = None
-            center_2 = None
             center_source = 'manual center distance input'
 
             if use_selected:
-                drive_selection = adsk.core.SelectionCommandInput.cast(inputs.itemById('driveOccurrence'))
-                driven_selection = adsk.core.SelectionCommandInput.cast(inputs.itemById('drivenOccurrence'))
-
-                drive_occ = _selection_to_occurrence(drive_selection, root_component)
-                driven_occ = _selection_to_occurrence(driven_selection, root_component)
-
-                if (not drive_occ) or (not driven_occ):
-                    auto_drive, auto_driven = _find_default_sprocket_occurrences(root_component)
-                    if not drive_occ:
-                        drive_occ = auto_drive
-                    if not driven_occ:
-                        driven_occ = auto_driven
-
+                drive_occ, driven_occ, center_source = _resolve_occurrences(inputs, root_component)
                 if (not drive_occ) or (not driven_occ):
                     ui.messageBox(
                         'Could not find drive/driven sprocket occurrences. '
-                        'Select both occurrences or disable "Use Selected Sprocket Centers".'
+                        'Select both occurrences, or generate tagged sprockets first, or disable "Use Selected Sprocket Centers".'
                     )
                     return
-
+                if drive_occ.entityToken == driven_occ.entityToken:
+                    ui.messageBox('Drive and driven selections must be different occurrences.')
+                    return
                 center_1 = _get_occurrence_center(drive_occ)
                 center_2 = _get_occurrence_center(driven_occ)
-                center_source = 'selected or auto-detected sprocket occurrences'
-
             else:
-                if manual_center_distance <= 0:
-                    ui.messageBox('Manual center distance must be positive.')
-                    return
-
                 center_1 = (0.0, 0.0, 0.0)
                 center_2 = (manual_center_distance, 0.0, 0.0)
 
             center_1_xy = (center_1[0], center_1[1])
             center_2_xy = (center_2[0], center_2[1])
-
             center_distance = _distance_2d(center_1_xy, center_2_xy)
 
             if center_distance <= (pitch_radius_1 + pitch_radius_2):
@@ -475,24 +760,50 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 ui.messageBox('Could not compute valid tangency for the provided sprocket geometry.')
                 return
 
-            if auto_link_count:
-                estimated_links = max(10, int(round(path_data['total_length'] / chain_pitch)))
-                link_count = estimated_links
-            else:
-                link_count = requested_link_count
-
-            if enforce_even_links and (link_count % 2 != 0):
-                link_count += 1
-
+            raw_link_count, link_count, even_adjusted = _determine_link_count(
+                path_data,
+                chain_pitch,
+                auto_link_count,
+                requested_link_count,
+                enforce_even_links,
+            )
             if link_count < 10:
                 ui.messageBox('Link count is too small to form a stable chain loop.')
                 return
 
             chain_points, actual_pitch = _sample_chain_points(path_data, link_count)
-
             if len(chain_points) < 4:
                 ui.messageBox('Failed to generate sufficient chain points.')
                 return
+
+            engineering_warnings = _center_distance_warnings(center_distance, chain_pitch)
+
+            drive_wrap_deg = math.degrees(path_data['arc1_delta'])
+            driven_wrap_deg = math.degrees(path_data['arc2_delta'])
+            if drive_wrap_deg < 120.0:
+                engineering_warnings.append(
+                    'Drive sprocket wrap angle is {:.2f} deg; low wrap can reduce tooth engagement under load.'.format(
+                        drive_wrap_deg
+                    )
+                )
+            if driven_wrap_deg < 120.0:
+                engineering_warnings.append(
+                    'Driven sprocket wrap angle is {:.2f} deg; low wrap can reduce tooth engagement under load.'.format(
+                        driven_wrap_deg
+                    )
+                )
+
+            if even_adjusted:
+                engineering_warnings.append(
+                    'Link count adjusted from {} to {} to keep an even count and avoid a half-link.'.format(
+                        raw_link_count,
+                        link_count,
+                    )
+                )
+
+            half_link_note = _half_link_note(link_count, drive_teeth, driven_teeth)
+            if half_link_note:
+                engineering_warnings.append(half_link_note)
 
             plane_z = (center_1[2] + center_2[2]) * 0.5
             z_mismatch = abs(center_1[2] - center_2[2])
@@ -507,30 +818,75 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             _create_chain_rollers(chain_component, chain_points, roller_diameter / 2.0, chain_width)
 
             center_mm = center_distance * 10.0
+            center_pitches = center_distance / chain_pitch
             requested_pitch_mm = chain_pitch * 10.0
             actual_pitch_mm = actual_pitch * 10.0
             pitch_error_pct = abs(actual_pitch - chain_pitch) / chain_pitch * 100.0
+            half_link_required = (link_count % 2 != 0)
+
+            csv_export_note = ''
+            if export_csv:
+                rows = [
+                    ('GeneratedAt', datetime.datetime.now().isoformat(timespec='seconds')),
+                    ('DriveTeeth', str(drive_teeth)),
+                    ('DrivenTeeth', str(driven_teeth)),
+                    ('ChainPitch_mm', '{:.4f}'.format(requested_pitch_mm)),
+                    ('RollerDiameter_mm', '{:.4f}'.format(roller_diameter * 10.0)),
+                    ('ChainWidth_mm', '{:.4f}'.format(chain_width * 10.0)),
+                    ('CenterDistance_mm', '{:.4f}'.format(center_mm)),
+                    ('CenterDistance_pitches', '{:.6f}'.format(center_pitches)),
+                    ('CenterSource', center_source),
+                    ('AutoLinkCount', str(auto_link_count)),
+                    ('RawLinkCount', str(raw_link_count)),
+                    ('FinalLinkCount', str(link_count)),
+                    ('EvenLinkAdjusted', str(even_adjusted)),
+                    ('HalfLinkRequired', str(half_link_required)),
+                    ('EffectivePitch_mm', '{:.4f}'.format(actual_pitch_mm)),
+                    ('PitchDeviation_pct', '{:.6f}'.format(pitch_error_pct)),
+                    ('DriveWrap_deg', '{:.4f}'.format(drive_wrap_deg)),
+                    ('DrivenWrap_deg', '{:.4f}'.format(driven_wrap_deg)),
+                    ('ZMismatch_mm', '{:.4f}'.format(z_mismatch * 10.0)),
+                    ('EngineeringWarnings', ' | '.join(engineering_warnings) if engineering_warnings else ''),
+                ]
+
+                export_path = _export_csv_dialog(ui, 'chain_drive', rows)
+                if export_path:
+                    csv_export_note = '\nCSV summary: {}'.format(export_path)
+                else:
+                    csv_export_note = '\nCSV summary: skipped by user.'
+
+            warning_block = ''
+            if engineering_warnings:
+                warning_block = '\n\nEngineering warnings:{}'.format(_format_issues(engineering_warnings))
 
             ui.messageBox(
                 'Created chain drive.\n\n'
                 'Drive teeth: {}\n'
                 'Driven teeth: {}\n'
-                'Center distance: {:.3f} mm\n'
+                'Center distance: {:.3f} mm ({:.3f} pitches)\n'
                 'Link count: {}\n'
+                'Half-link required: {}\n'
                 'Requested pitch: {:.3f} mm\n'
                 'Effective pitch: {:.3f} mm\n'
                 'Pitch deviation: {:.3f}%\n'
+                'Wrap angle (drive / driven): {:.2f} / {:.2f} deg\n'
                 'Center source: {}\n'
-                'Z mismatch between sprocket centers: {:.3f} mm'.format(
+                'Z mismatch between sprocket centers: {:.3f} mm{}{}'.format(
                     drive_teeth,
                     driven_teeth,
                     center_mm,
+                    center_pitches,
                     link_count,
+                    'Yes' if half_link_required else 'No',
                     requested_pitch_mm,
                     actual_pitch_mm,
                     pitch_error_pct,
+                    drive_wrap_deg,
+                    driven_wrap_deg,
                     center_source,
                     z_mismatch * 10.0,
+                    warning_block,
+                    csv_export_note,
                 )
             )
 
